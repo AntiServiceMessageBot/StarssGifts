@@ -1,544 +1,520 @@
-import asyncio
 import logging
-import sqlite3
-import random
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-from collections import defaultdict
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+import json
+import os
 
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Конфигурация
-TOKEN = "7739594735:AAENvoaOK01JNRl5CXfqzTzlXGLUun715Bk"
-ADMIN_GROUP_ID = -1001234567890
-CHANNEL_ID = "@your_channel"
-OWNER_ID = 5261397307
-
-bot = Bot(token=TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-
-# Эмодзи
-EMOJI = {
-    "main": "🎮", "nft": "🎁", "stars": "⭐", "premium": "👑",
-    "auction": "🔨", "reviews": "📝", "support": "🆘", "settings": "⚙️",
-    "admin": "👨‍💼", "back": "🔙", "success": "✅", "error": "❌",
-    "warning": "⚠️", "money": "💰", "time": "⏰", "user": "👤"
+# Данные каталога подарков (можно вынести в базу данных)
+CATALOG = {
+    "popular": {
+        "name": "🎁 Популярные подарки",
+        "items": [
+            {"id": 1, "name": "Смартфон iPhone 15", "price": 79990, "category": "electronics", "image": "iphone.jpg"},
+            {"id": 2, "name": "Наушники Sony WH-1000XM5", "price": 29990, "category": "electronics", "image": "sony.jpg"},
+            {"id": 3, "name": "Умные часы Apple Watch", "price": 34990, "category": "electronics", "image": "watch.jpg"},
+        ]
+    },
+    "electronics": {
+        "name": "📱 Электроника",
+        "items": [
+            {"id": 1, "name": "Смартфон iPhone 15", "price": 79990, "category": "electronics", "image": "iphone.jpg"},
+            {"id": 2, "name": "Наушники Sony WH-1000XM5", "price": 29990, "category": "electronics", "image": "sony.jpg"},
+            {"id": 4, "name": "Ноутбук MacBook Air", "price": 89990, "category": "electronics", "image": "macbook.jpg"},
+            {"id": 5, "name": "Планшет iPad Pro", "price": 74990, "category": "electronics", "image": "ipad.jpg"},
+        ]
+    },
+    "books": {
+        "name": "📚 Книги",
+        "items": [
+            {"id": 6, "name": "Художественная литература", "price": 890, "category": "books", "image": "book1.jpg"},
+            {"id": 7, "name": "Бизнес-литература", "price": 1290, "category": "books", "image": "book2.jpg"},
+        ]
+    },
+    "clothes": {
+        "name": "👕 Одежда",
+        "items": [
+            {"id": 8, "name": "Футболка премиум", "price": 2990, "category": "clothes", "image": "tshirt.jpg"},
+            {"id": 9, "name": "Свитер ручной работы", "price": 4990, "category": "clothes", "image": "sweater.jpg"},
+        ]
+    },
+    "experience": {
+        "name": "🎪 Впечатления",
+        "items": [
+            {"id": 10, "name": "Сертификат в СПА", "price": 5990, "category": "experience", "image": "spa.jpg"},
+            {"id": 11, "name": "Мастер-класс по кулинарии", "price": 3990, "category": "experience", "image": "cooking.jpg"},
+        ]
+    }
 }
 
-# Состояния
-class UserStates(StatesGroup):
-    main_menu = State()
-    buy_nft = State()
-    buy_stars = State()
-    buy_premium = State()
+# Хранилище для корзин пользователей (в продакшене лучше использовать БД)
+user_carts = {}
 
-class AdminStates(StatesGroup):
-    admin_menu = State()
-    add_nft = State()
-    add_nft_name = State()
-    add_nft_price = State()
-    add_nft_link = State()
+# Команда /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    welcome_text = f"""
+👋 Привет, {user.first_name}!
 
-# База данных
-class Database:
-    def __init__(self):
-        self.conn = sqlite3.connect("bot.db", check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.init_db()
-    
-    def init_db(self):
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                subscribed INTEGER DEFAULT 0,
-                banned INTEGER DEFAULT 0
-            )
-        ''')
-        
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS staff (
-                user_id INTEGER PRIMARY KEY,
-                role TEXT
-            )
-        ''')
-        
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS nft_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT,
-                price REAL,
-                link TEXT
-            )
-        ''')
-        
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                order_type TEXT,
-                details TEXT,
-                status TEXT DEFAULT 'a'
-            )
-        ''')
-        
-        # Добавляем владельца
-        self.cursor.execute('INSERT OR IGNORE INTO staff VALUES (?, ?)', (OWNER_ID, 'owner'))
-        
-        self.conn.commit()
-    
-    def add_user(self, user_id: int, username: str):
-        self.cursor.execute('INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)', (user_id, username))
-        self.conn.commit()
-    
-    def is_admin(self, user_id: int) -> bool:
-        self.cursor.execute('SELECT role FROM staff WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        return result is not None
-    
-    def is_owner(self, user_id: int) -> bool:
-        self.cursor.execute('SELECT role FROM staff WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        return result and result[0] == 'owner'
-    
-    def add_nft(self, name: str, price: float, link: str):
-        self.cursor.execute('INSERT INTO nft_items (name, price, link) VALUES (?, ?, ?)', (name, price, link))
-        self.conn.commit()
-    
-    def get_nft_items(self) -> List[Dict]:
-        self.cursor.execute('SELECT id, name, price, link FROM nft_items')
-        return [
-            {'id': row[0], 'name': row[1], 'price': row[2], 'link': row[3]}
-            for row in self.cursor.fetchall()
-        ]
-    
-    def create_order(self, user_id: int, order_type: str, details: str = "") -> int:
-        self.cursor.execute(
-            'INSERT INTO orders (user_id, order_type, details) VALUES (?, ?, ?)',
-            (user_id, order_type, details)
-        )
-        self.conn.commit()
-        return self.cursor.lastrowid
-    
-    def update_order_status(self, order_id: int, status: str):
-        self.cursor.execute('UPDATE orders SET status = ? WHERE id = ?', (status, order_id))
-        self.conn.commit()
-    
-    def get_order(self, order_id: int) -> Optional[Dict]:
-        self.cursor.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
-        row = self.cursor.fetchone()
-        if row:
-            columns = [desc[0] for desc in self.cursor.description]
-            return dict(zip(columns, row))
-        return None
-    
-    def close(self):
-        self.conn.close()
+🎁 Добро пожаловать в каталог подарков! 
+Здесь вы найдете идеи для подарков на любой случай.
 
-db = Database()
+📋 Доступные команды:
+/catalog - Посмотреть каталог подарков
+/cart - Посмотреть корзину
+/help - Помощь по использованию бота
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton("🎁 Открыть каталог", callback_data='open_catalog')],
+        [InlineKeyboardButton("🛒 Моя корзина", callback_data='view_cart')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
-# Утилиты
-async def check_subscription(user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        return member.status in ['member', 'administrator', 'creator']
-    except:
-        return True  # Для теста
+# Команда /catalog
+async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_categories(update, context)
 
-async def send_to_admins(text: str, keyboard: InlineKeyboardMarkup = None):
-    try:
-        await bot.send_message(ADMIN_GROUP_ID, text, reply_markup=keyboard, parse_mode="Markdown")
-    except:
-        pass
+# Показать категории
+async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = []
+    
+    # Создаем кнопки для каждой категории
+    for category_id, category_data in CATALOG.items():
+        keyboard.append([InlineKeyboardButton(
+            category_data['name'], 
+            callback_data=f'category_{category_id}'
+        )])
+    
+    # Добавляем дополнительные кнопки
+    keyboard.append([InlineKeyboardButton("🛒 Корзина", callback_data='view_cart')])
+    keyboard.append([InlineKeyboardButton("🔍 Поиск подарков", callback_data='search_gifts')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = "📂 Выберите категорию подарков:"
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup)
 
-# Клавиатуры
-def get_main_menu(user_id: int):
-    buttons = [
-        [InlineKeyboardButton(text=f"{EMOJI['nft']} Купить NFT", callback_data="buy_nft")],
-        [InlineKeyboardButton(text=f"{EMOJI['stars']} Купить звезды", callback_data="buy_stars")],
-        [InlineKeyboardButton(text=f"{EMOJI['premium']} Купить премиум", callback_data="buy_premium")],
-        [InlineKeyboardButton(text=f"{EMOJI['support']} Поддержка", callback_data="support")]
+# Показать товары в категории
+async def show_category_items(update: Update, context: ContextTypes.DEFAULT_TYPE, category_id: str):
+    category = CATALOG.get(category_id)
+    if not category:
+        await update.callback_query.answer("Категория не найдена!")
+        return
+    
+    items = category['items']
+    text = f"🎁 *{category['name']}*\n\n"
+    
+    # Формируем список товаров
+    for idx, item in enumerate(items, 1):
+        text += f"{idx}. *{item['name']}*\n"
+        text += f"   💰 Цена: {item['price']:,} руб.\n"
+        text += f"   [Добавить в корзину](callback:add_{item['id']}_{category_id})\n\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить в корзину", switch_inline_query_current_chat=f"add_{category_id}")],
+        [InlineKeyboardButton("📂 Назад к категориям", callback_data='back_to_categories')],
+        [InlineKeyboardButton("🛒 Корзина", callback_data='view_cart')]
     ]
     
-    if db.is_admin(user_id):
-        buttons.append([InlineKeyboardButton(text=f"{EMOJI['admin']} Админ", callback_data="admin")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    await update.callback_query.edit_message_text(
+        text, 
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
-def get_order_keyboard(order_id: int):
-    buttons = [
+# Показать детали товара
+async def show_item_details(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: int, category_id: str):
+    category = CATALOG.get(category_id)
+    if not category:
+        await update.callback_query.answer("Товар не найден!")
+        return
+    
+    item = next((i for i in category['items'] if i['id'] == item_id), None)
+    if not item:
+        await update.callback_query.answer("Товар не найден!")
+        return
+    
+    text = f"""
+🎁 *{item['name']}*
+
+💰 *Цена:* {item['price']:,} руб.
+📁 *Категория:* {category['name']}
+
+📝 *Описание:*
+Идеальный подарок для любого случая! 
+Высокое качество и гарантия от производителя.
+
+🎯 *Особенности:*
+• Премиум качество
+• Гарантия 1 год
+• Быстрая доставка
+• Возможность возврата
+    """
+    
+    keyboard = [
         [
-            InlineKeyboardButton(text="✅ Взять", callback_data=f"take_{order_id}"),
-            InlineKeyboardButton(text="❌ СПАМ", callback_data=f"spam_{order_id}")
+            InlineKeyboardButton("🛒 Добавить в корзину", callback_data=f'add_to_cart_{item_id}_{category_id}'),
+            InlineKeyboardButton("⭐ В избранное", callback_data=f'favorite_{item_id}')
         ],
         [
-            InlineKeyboardButton(text="💰 Не оплатил", callback_data=f"nopay_{order_id}"),
-            InlineKeyboardButton(text="✅ Завершить", callback_data=f"complete_{order_id}")
+            InlineKeyboardButton("📂 Назад к категории", callback_data=f'category_{category_id}'),
+            InlineKeyboardButton("🛒 Корзина", callback_data='view_cart')
         ]
     ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-# Обработчики
-@dp.message(Command("start"))
-async def start_cmd(message: Message, state: FSMContext):
-    user_id = message.from_user.id
     
-    if not await check_subscription(user_id):
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{CHANNEL_ID[1:]}")],
-            [InlineKeyboardButton(text="✅ Проверить", callback_data="check_sub")]
-        ])
-        await message.answer(f"{EMOJI['warning']} Подпишитесь на канал!", reply_markup=keyboard)
-        return
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    db.add_user(user_id, message.from_user.username)
-    
-    await state.set_state(UserStates.main_menu)
-    await message.answer(
-        f"{EMOJI['main']} *Главное меню*\n\nВыберите действие:",
-        reply_markup=get_main_menu(user_id),
-        parse_mode="Markdown"
+    await update.callback_query.edit_message_text(
+        text, 
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
     )
 
-@dp.callback_query(F.data == "check_sub")
-async def check_sub(callback: CallbackQuery, state: FSMContext):
-    if await check_subscription(callback.from_user.id):
-        await callback.message.edit_text(
-            f"{EMOJI['success']} *Главное меню*\n\nВыберите действие:",
-            reply_markup=get_main_menu(callback.from_user.id),
-            parse_mode="Markdown"
+# Показать корзину
+async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # Получаем корзину пользователя
+    cart = user_carts.get(user_id, {})
+    
+    if not cart:
+        text = "🛒 Ваша корзина пуста!\n\nПерейдите в каталог, чтобы добавить подарки."
+        keyboard = [
+            [InlineKeyboardButton("🎁 Открыть каталог", callback_data='open_catalog')]
+        ]
+    else:
+        total = 0
+        text = "🛒 *Ваша корзина:*\n\n"
+        
+        for item_id, quantity in cart.items():
+            # Находим товар в каталоге
+            item = None
+            category_id = None
+            for cat_id, cat_data in CATALOG.items():
+                for itm in cat_data['items']:
+                    if itm['id'] == item_id:
+                        item = itm
+                        category_id = cat_id
+                        break
+                if item:
+                    break
+            
+            if item:
+                item_total = item['price'] * quantity
+                total += item_total
+                text += f"• {item['name']}\n"
+                text += f"  Количество: {quantity}\n"
+                text += f"  Сумма: {item_total:,} руб.\n"
+                text += f"  [Изменить](callback:edit_{item_id}_{category_id})\n\n"
+        
+        text += f"💎 *Итого: {total:,} руб.*"
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("➕ Добавить ещё", callback_data='open_catalog'),
+                InlineKeyboardButton("🗑 Очистить корзину", callback_data='clear_cart')
+            ],
+            [
+                InlineKeyboardButton("💳 Оформить заказ", callback_data='checkout'),
+                InlineKeyboardButton("🎁 Продолжить покупки", callback_data='open_catalog')
+            ]
+        ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, 
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
         )
     else:
-        await callback.answer("❌ Вы не подписаны!", show_alert=True)
-
-@dp.callback_query(F.data == "back")
-async def back_to_menu(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(UserStates.main_menu)
-    await callback.message.edit_text(
-        f"{EMOJI['main']} *Главное меню*\n\nВыберите действие:",
-        reply_markup=get_main_menu(callback.from_user.id),
-        parse_mode="Markdown"
-    )
-
-# NFT
-@dp.callback_query(F.data == "buy_nft")
-async def buy_nft(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(UserStates.buy_nft)
-    
-    nft_items = db.get_nft_items()
-    builder = InlineKeyboardBuilder()
-    
-    for item in nft_items[:8]:  # Первые 8
-        builder.button(text=f"{item['name']} | {item['price']}$", callback_data=f"nft_{item['id']}")
-    
-    builder.button(text=f"{EMOJI['back']} Назад", callback_data="back")
-    builder.adjust(1)
-    
-    text = f"{EMOJI['nft']} *NFT подарки*\n\nВыберите:"
-    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("nft_"))
-async def select_nft(callback: CallbackQuery):
-    nft_id = int(callback.data.split("_")[1])
-    nft_items = db.get_nft_items()
-    item = next((i for i in nft_items if i['id'] == nft_id), None)
-    
-    if item:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🛒 Купить", callback_data=f"buynft_{nft_id}")],
-            [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="buy_nft")]
-        ])
-        
-        await callback.message.edit_text(
-            f"{EMOJI['nft']} *{item['name']}*\n\n"
-            f"💰 Цена: {item['price']}$\n"
-            f"🔗 Ссылка: {item['link']}",
-            reply_markup=keyboard,
-            parse_mode="Markdown"
+        await update.message.reply_text(
+            text, 
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
         )
 
-@dp.callback_query(F.data.startswith("buynft_"))
-async def buy_nft_item(callback: CallbackQuery):
-    nft_id = int(callback.data.split("_")[1])
-    order_id = db.create_order(
-        user_id=callback.from_user.id,
-        order_type="nft",
-        details=f"NFT ID: {nft_id}"
-    )
+# Добавить товар в корзину
+async def add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: int, category_id: str):
+    user_id = update.effective_user.id
     
-    order = db.get_order(order_id)
-    text = f"""🆕 *НОВЫЙ ЗАКАЗ*
+    # Инициализируем корзину, если её нет
+    if user_id not in user_carts:
+        user_carts[user_id] = {}
+    
+    # Добавляем товар в корзину
+    if item_id in user_carts[user_id]:
+        user_carts[user_id][item_id] += 1
+    else:
+        user_carts[user_id][item_id] = 1
+    
+    await update.callback_query.answer(f"Товар добавлен в корзину! 🛒")
+    
+    # Показываем обновленную корзину
+    await show_cart(update, context)
 
-1. Номер: #{order['id']}
-2. ID: `{order['user_id']}`
-3. Ник: @{callback.from_user.username or 'Нет'}
-4. Причина: NFT
-5. Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
-6. Состояние: ❌ Не взято"""
+# Обработчик callback запросов
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     
-    await send_to_admins(text, get_order_keyboard(order_id))
+    data = query.data
     
-    await callback.message.edit_text(
-        f"{EMOJI['success']} Заказ оформлен! С вами скоро свяжутся.",
-        parse_mode="Markdown"
-    )
+    if data == 'open_catalog':
+        await show_categories(update, context)
+    
+    elif data == 'view_cart':
+        await show_cart(update, context)
+    
+    elif data == 'back_to_categories':
+        await show_categories(update, context)
+    
+    elif data == 'help':
+        await help_command(update, context)
+    
+    elif data == 'search_gifts':
+        await search_gifts(update, context)
+    
+    elif data == 'clear_cart':
+        user_id = update.effective_user.id
+        if user_id in user_carts:
+            user_carts[user_id] = {}
+        await query.answer("Корзина очищена!")
+        await show_cart(update, context)
+    
+    elif data == 'checkout':
+        await checkout(update, context)
+    
+    elif data.startswith('category_'):
+        category_id = data.split('_')[1]
+        await show_category_items(update, context, category_id)
+    
+    elif data.startswith('add_to_cart_'):
+        _, _, item_id, category_id = data.split('_')
+        await add_to_cart(update, context, int(item_id), category_id)
+    
+    elif data.startswith('item_'):
+        _, item_id, category_id = data.split('_')
+        await show_item_details(update, context, int(item_id), category_id)
 
-# Звезды
-@dp.callback_query(F.data == "buy_stars")
-async def buy_stars(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(UserStates.buy_stars)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="50 звезд - 99₽", callback_data="stars_1")],
-        [InlineKeyboardButton(text="100 звезд - 199₽", callback_data="stars_2")],
-        [InlineKeyboardButton(text="300 звезд - 499₽", callback_data="stars_3")],
-        [InlineKeyboardButton(text="500 звезд - 999₽", callback_data="stars_4")],
-        [InlineKeyboardButton(text="1000 звезд - 1999₽", callback_data="stars_5")],
-        [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="back")]
-    ])
-    
-    await callback.message.edit_text(
-        f"{EMOJI['stars']} *Telegram Stars*\n\nВыберите пакет:",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
+# Поиск подарков
+async def search_gifts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = """
+🔍 *Поиск подарков*
 
-@dp.callback_query(F.data.startswith("stars_"))
-async def select_stars(callback: CallbackQuery):
-    order_id = db.create_order(
-        user_id=callback.from_user.id,
-        order_type="stars",
-        details=callback.data
-    )
-    
-    order = db.get_order(order_id)
-    text = f"""🆕 *НОВЫЙ ЗАКАЗ*
+Введите ключевые слова для поиска подарков.
+Например: "книга", "электроника", "для мамы", "на день рождения"
 
-1. Номер: #{order['id']}
-2. ID: `{order['user_id']}`
-3. Ник: @{callback.from_user.username or 'Нет'}
-4. Причина: ЗВЕЗДЫ
-5. Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
-6. Состояние: ❌ Не взято"""
+✨ *Советы для поиска:*
+• Укажите повод (день рождения, новый год)
+• Укажите получателя (для мужчины, для ребенка)
+• Укажите бюджет (до 5000 руб.)
+    """
     
-    await send_to_admins(text, get_order_keyboard(order_id))
+    keyboard = [
+        [InlineKeyboardButton("📂 Каталог", callback_data='open_catalog')],
+        [InlineKeyboardButton("🛒 Корзина", callback_data='view_cart')]
+    ]
     
-    await callback.message.edit_text(
-        f"{EMOJI['success']} Заказ оформлен! С вами скоро свяжутся.",
-        parse_mode="Markdown"
-    )
-
-# Премиум
-@dp.callback_query(F.data == "buy_premium")
-async def buy_premium(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(UserStates.buy_premium)
+    reply_markup = InlineKeyboardMarkup(keyboard)
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="1 месяц - 6.2$", callback_data="premium_1")],
-        [InlineKeyboardButton(text="3 месяца - 10$", callback_data="premium_2")],
-        [InlineKeyboardButton(text="6 месяцев - 18$", callback_data="premium_3")],
-        [InlineKeyboardButton(text="1 год - 35$", callback_data="premium_4")],
-        [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="back")]
-    ])
-    
-    await callback.message.edit_text(
-        f"{EMOJI['premium']} *Telegram Premium*\n\nВыберите период:",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data.startswith("premium_"))
-async def select_premium(callback: CallbackQuery):
-    order_id = db.create_order(
-        user_id=callback.from_user.id,
-        order_type="premium",
-        details=callback.data
-    )
-    
-    order = db.get_order(order_id)
-    text = f"""🆕 *НОВЫЙ ЗАКАЗ*
-
-1. Номер: #{order['id']}
-2. ID: `{order['user_id']}`
-3. Ник: @{callback.from_user.username or 'Нет'}
-4. Причина: PREMIUM
-5. Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
-6. Состояние: ❌ Не взято"""
-    
-    await send_to_admins(text, get_order_keyboard(order_id))
-    
-    await callback.message.edit_text(
-        f"{EMOJI['success']} Заказ оформлен! С вами скоро свяжутся.",
-        parse_mode="Markdown"
+    await update.callback_query.edit_message_text(
+        text, 
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
     )
 
-# Поддержка
-@dp.callback_query(F.data == "support")
-async def support(callback: CallbackQuery):
-    order_id = db.create_order(
-        user_id=callback.from_user.id,
-        order_type="support",
-        details="Запрос в поддержку"
-    )
+# Оформление заказа
+async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    cart = user_carts.get(user_id, {})
     
-    order = db.get_order(order_id)
-    text = f"""🆕 *ПОДДЕРЖКА*
-
-1. Номер: #{order['id']}
-2. ID: `{order['user_id']}`
-3. Ник: @{callback.from_user.username or 'Нет'}
-4. Причина: ПОДДЕРЖКА
-5. Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
-6. Состояние: ❌ Не взято"""
-    
-    await send_to_admins(text, get_order_keyboard(order_id))
-    
-    await callback.message.edit_text(
-        f"{EMOJI['success']} Ваш запрос отправлен! Ожидайте ответа.",
-        parse_mode="Markdown"
-    )
-
-# Админ панель
-@dp.callback_query(F.data == "admin")
-async def admin_panel(callback: CallbackQuery, state: FSMContext):
-    if not db.is_admin(callback.from_user.id):
-        await callback.answer("❌ Нет доступа!", show_alert=True)
+    if not cart:
+        await update.callback_query.answer("Ваша корзина пуста!")
         return
     
-    await state.set_state(AdminStates.admin_menu)
+    # Рассчитываем итог
+    total = 0
+    items_list = []
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить NFT", callback_data="add_nft")],
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
-        [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="back")]
-    ])
+    for item_id, quantity in cart.items():
+        for category in CATALOG.values():
+            for item in category['items']:
+                if item['id'] == item_id:
+                    total += item['price'] * quantity
+                    items_list.append(f"{item['name']} x{quantity}")
+                    break
     
-    await callback.message.edit_text(
-        f"{EMOJI['admin']} *Админ панель*\n\nВыберите действие:",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
+    text = f"""
+💳 *Оформление заказа*
+
+🎁 *Ваш заказ:*
+{chr(10).join(items_list)}
+
+💰 *Сумма заказа:* {total:,} руб.
+
+📦 *Доставка:* 500 руб.
+💎 *Итого к оплате:* {total + 500:,} руб.
+
+📝 *Данные для доставки:*
+Пожалуйста, отправьте ваш адрес и контактный телефон в ответном сообщении.
+
+⏳ *Срок обработки:* 1-2 рабочих дня
+🚚 *Срок доставки:* 3-7 дней
+    """
+    
+    keyboard = [
+        [InlineKeyboardButton("✅ Подтвердить заказ", callback_data='confirm_order')],
+        [InlineKeyboardButton("✏️ Изменить корзину", callback_data='view_cart')],
+        [InlineKeyboardButton("❌ Отменить", callback_data='open_catalog')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.callback_query.edit_message_text(
+        text, 
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
     )
 
-@dp.callback_query(F.data == "add_nft")
-async def add_nft_start(callback: CallbackQuery, state: FSMContext):
-    if not db.is_admin(callback.from_user.id):
-        await callback.answer("❌ Нет доступа!", show_alert=True)
-        return
-    
-    await state.set_state(AdminStates.add_nft_name)
-    await callback.message.edit_text(
-        f"{EMOJI['nft']} *Добавление NFT*\n\nВведите название подарка:",
-        parse_mode="Markdown"
-    )
+# Команда /help
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = """
+❓ *Помощь по использованию бота*
 
-@dp.message(AdminStates.add_nft_name)
-async def add_nft_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await state.set_state(AdminStates.add_nft_price)
-    await message.answer(f"{EMOJI['money']} Введите цену в $:")
+*Основные команды:*
+🎁 `/catalog` - Открыть каталог подарков
+🛒 `/cart` - Посмотреть корзину
+🔍 `/search` - Поиск подарков
+❓ `/help` - Эта справка
 
-@dp.message(AdminStates.add_nft_price)
-async def add_nft_price(message: Message, state: FSMContext):
-    try:
-        price = float(message.text)
-        await state.update_data(price=price)
-        await state.set_state(AdminStates.add_nft_link)
-        await message.answer(f"{EMOJI['link']} Отправьте ссылку на подарок:")
-    except:
-        await message.answer("❌ Введите число!")
+*Как пользоваться:*
+1. Откройте каталог командой /catalog
+2. Выберите категорию подарков
+3. Просмотрите доступные товары
+4. Добавьте понравившиеся товары в корзину
+5. Перейдите в корзину для оформления заказа
 
-@dp.message(AdminStates.add_nft_link)
-async def add_nft_link(message: Message, state: FSMContext):
-    data = await state.get_data()
-    db.add_nft(data['name'], data['price'], message.text)
-    
-    await message.answer(f"{EMOJI['success']} NFT добавлен!")
-    await state.clear()
+*Функции бота:*
+• 📂 Категории подарков
+• 🎁 Детальная информация о товарах
+• 🛒 Корзина с товарами
+• 💳 Оформление заказа
+• 🔍 Поиск по каталогу
 
-# Обработка заказов админами
-@dp.callback_query(F.data.startswith("take_"))
-async def take_order(callback: CallbackQuery):
-    if not db.is_admin(callback.from_user.id):
-        await callback.answer("❌ Нет доступа!", show_alert=True)
-        return
+📞 *Поддержка:*
+По всем вопросам пишите: @support
+    """
     
-    order_id = int(callback.data.split("_")[1])
-    db.update_order_status(order_id, "b")  # В процессе
+    keyboard = [
+        [InlineKeyboardButton("🎁 Открыть каталог", callback_data='open_catalog')],
+        [InlineKeyboardButton("🛒 Моя корзина", callback_data='view_cart')]
+    ]
     
-    order = db.get_order(order_id)
-    text = f"""🔄 *ЗАКАЗ В РАБОТЕ*
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            help_text, 
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text(
+            help_text, 
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
 
-1. Номер: #{order['id']}
-2. ID: `{order['user_id']}`
-3. Ник: @{callback.from_user.username or 'Нет'}
-4. Причина: {order['order_type'].upper()}
-5. Дата: {order['id']}
-6. Состояние: 🔄 В процессе
-7. Админ: @{callback.from_user.username}"""
+# Обработка текстовых сообщений (для поиска)
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower()
+    user_id = update.effective_user.id
     
-    await callback.message.edit_text(text, reply_markup=get_order_keyboard(order_id), parse_mode="Markdown")
-    await callback.answer("✅ Заказ взят!")
+    # Простой поиск по каталогу
+    if len(text) > 2:  # Если сообщение длиннее 2 символов
+        found_items = []
+        
+        for category_id, category_data in CATALOG.items():
+            for item in category_data['items']:
+                if text in item['name'].lower():
+                    found_items.append((item, category_id))
+        
+        if found_items:
+            response = f"🔍 *Найдено {len(found_items)} подарков по запросу \"{text}\":*\n\n"
+            
+            for idx, (item, category_id) in enumerate(found_items[:5], 1):  # Ограничиваем 5 результатами
+                response += f"{idx}. *{item['name']}*\n"
+                response += f"   💰 Цена: {item['price']:,} руб.\n"
+                response += f"   📁 Категория: {category_data['name']}\n"
+                response += f"   [Подробнее](callback:item_{item['id']}_{category_id})\n\n"
+            
+            if len(found_items) > 5:
+                response += f"*... и ещё {len(found_items) - 5} подарков*\n"
+            
+            keyboard = [
+                [InlineKeyboardButton("🎁 Открыть каталог", callback_data='open_catalog')],
+                [InlineKeyboardButton("🔍 Новый поиск", callback_data='search_gifts')]
+            ]
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                response,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            return
+    
+    # Если поиск не дал результатов или сообщение короткое
+    if len(text) > 2:
+        await update.message.reply_text(
+            "😔 По вашему запросу ничего не найдено.\n\nПопробуйте:\n"
+            "• Другие ключевые слова\n"
+            "• Откройте каталог командой /catalog\n"
+            "• Используйте /search для подсказок"
+        )
 
-@dp.callback_query(F.data.startswith("complete_"))
-async def complete_order(callback: CallbackQuery):
-    if not db.is_admin(callback.from_user.id):
-        await callback.answer("❌ Нет доступа!", show_alert=True)
-        return
+# Основная функция
+def main():
+    # Вставьте ваш токен бота
+    TOKEN = "ВАШ_ТОКЕН_БОТА"
     
-    order_id = int(callback.data.split("_")[1])
-    db.update_order_status(order_id, "s")  # Завершено
-    await callback.answer("✅ Заказ завершен!")
+    # Создаем приложение
+    application = Application.builder().token(TOKEN).build()
+    
+    # Регистрируем обработчики команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("catalog", catalog))
+    application.add_handler(CommandHandler("cart", show_cart))
+    application.add_handler(CommandHandler("help", help_command))
+    
+    # Регистрируем обработчики кнопок
+    application.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Регистрируем обработчик текстовых сообщений
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    # Запускаем бота
+    print("Бот запущен...")
+    application.run_polling(allowed_updates=Update.ALL_UPDATES)
 
-@dp.callback_query(F.data.startswith("spam_"))
-async def spam_order(callback: CallbackQuery):
-    if not db.is_admin(callback.from_user.id):
-        await callback.answer("❌ Нет доступа!", show_alert=True)
-        return
-    
-    order_id = int(callback.data.split("_")[1])
-    db.update_order_status(order_id, "z")  # Спам
-    
-    order = db.get_order(order_id)
-    try:
-        await bot.send_message(order['user_id'], f"{EMOJI['error']} Ошибка. Связь с базой...")
-    except:
-        pass
-    
-    await callback.answer("🚫 Помечено как спам!")
-
-@dp.callback_query(F.data.startswith("nopay_"))
-async def nopay_order(callback: CallbackQuery):
-    if not db.is_admin(callback.from_user.id):
-        await callback.answer("❌ Нет доступа!", show_alert=True)
-        return
-    
-    order_id = int(callback.data.split("_")[1])
-    db.update_order_status(order_id, "g")  # Не оплатил
-    
-    order = db.get_order(order_id)
-    try:
-        await bot.send_message(order['user_id'], f"{EMOJI['error']} Вы не оплатили заказ!")
-    except:
-        pass
-    
-    await callback.answer("💰 Не оплатил!")
-
-# Запуск бота
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    print("Бот запущен!")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nБот остановлен")
-    finally:
-        db.close()
+if __name__ == '__main__':
+    main()
