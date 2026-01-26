@@ -1,37 +1,544 @@
 import asyncio
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.filters import CommandStart
+import logging
+import sqlite3
+import random
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from collections import defaultdict
 
-# Замените 'YOUR_BOT_TOKEN' на токен вашего бота
-API_TOKEN = '7739594735:AAENvoaOK01JNRl5CXfqzTzlXGLUun715Bk'
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+# Конфигурация
+TOKEN = "7739594735:AAENvoaOK01JNRl5CXfqzTzlXGLUun715Bk"
+ADMIN_GROUP_ID = -1001234567890
+CHANNEL_ID = "@your_channel"
+OWNER_ID = 5261397307
 
-# Создаем клавиатуру с кнопкой для отправки местоположения
-keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="Отправить местоположение", request_location=True)]
-    ],
-    resize_keyboard=True
-)
+bot = Bot(token=TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
-@dp.message(CommandStart())
-async def send_welcome(message: types.Message):
-    await message.reply(
-        "Привет! Нажмите кнопку ниже, чтобы отправить ваше местоположение.",
-        reply_markup=keyboard
+# Эмодзи
+EMOJI = {
+    "main": "🎮", "nft": "🎁", "stars": "⭐", "premium": "👑",
+    "auction": "🔨", "reviews": "📝", "support": "🆘", "settings": "⚙️",
+    "admin": "👨‍💼", "back": "🔙", "success": "✅", "error": "❌",
+    "warning": "⚠️", "money": "💰", "time": "⏰", "user": "👤"
+}
+
+# Состояния
+class UserStates(StatesGroup):
+    main_menu = State()
+    buy_nft = State()
+    buy_stars = State()
+    buy_premium = State()
+
+class AdminStates(StatesGroup):
+    admin_menu = State()
+    add_nft = State()
+    add_nft_name = State()
+    add_nft_price = State()
+    add_nft_link = State()
+
+# База данных
+class Database:
+    def __init__(self):
+        self.conn = sqlite3.connect("bot.db", check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.init_db()
+    
+    def init_db(self):
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                subscribed INTEGER DEFAULT 0,
+                banned INTEGER DEFAULT 0
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS staff (
+                user_id INTEGER PRIMARY KEY,
+                role TEXT
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS nft_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                price REAL,
+                link TEXT
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                order_type TEXT,
+                details TEXT,
+                status TEXT DEFAULT 'a'
+            )
+        ''')
+        
+        # Добавляем владельца
+        self.cursor.execute('INSERT OR IGNORE INTO staff VALUES (?, ?)', (OWNER_ID, 'owner'))
+        
+        self.conn.commit()
+    
+    def add_user(self, user_id: int, username: str):
+        self.cursor.execute('INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)', (user_id, username))
+        self.conn.commit()
+    
+    def is_admin(self, user_id: int) -> bool:
+        self.cursor.execute('SELECT role FROM staff WHERE user_id = ?', (user_id,))
+        result = self.cursor.fetchone()
+        return result is not None
+    
+    def is_owner(self, user_id: int) -> bool:
+        self.cursor.execute('SELECT role FROM staff WHERE user_id = ?', (user_id,))
+        result = self.cursor.fetchone()
+        return result and result[0] == 'owner'
+    
+    def add_nft(self, name: str, price: float, link: str):
+        self.cursor.execute('INSERT INTO nft_items (name, price, link) VALUES (?, ?, ?)', (name, price, link))
+        self.conn.commit()
+    
+    def get_nft_items(self) -> List[Dict]:
+        self.cursor.execute('SELECT id, name, price, link FROM nft_items')
+        return [
+            {'id': row[0], 'name': row[1], 'price': row[2], 'link': row[3]}
+            for row in self.cursor.fetchall()
+        ]
+    
+    def create_order(self, user_id: int, order_type: str, details: str = "") -> int:
+        self.cursor.execute(
+            'INSERT INTO orders (user_id, order_type, details) VALUES (?, ?, ?)',
+            (user_id, order_type, details)
+        )
+        self.conn.commit()
+        return self.cursor.lastrowid
+    
+    def update_order_status(self, order_id: int, status: str):
+        self.cursor.execute('UPDATE orders SET status = ? WHERE id = ?', (status, order_id))
+        self.conn.commit()
+    
+    def get_order(self, order_id: int) -> Optional[Dict]:
+        self.cursor.execute('SELECT * FROM orders WHERE id = ?', (order_id,))
+        row = self.cursor.fetchone()
+        if row:
+            columns = [desc[0] for desc in self.cursor.description]
+            return dict(zip(columns, row))
+        return None
+    
+    def close(self):
+        self.conn.close()
+
+db = Database()
+
+# Утилиты
+async def check_subscription(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except:
+        return True  # Для теста
+
+async def send_to_admins(text: str, keyboard: InlineKeyboardMarkup = None):
+    try:
+        await bot.send_message(ADMIN_GROUP_ID, text, reply_markup=keyboard, parse_mode="Markdown")
+    except:
+        pass
+
+# Клавиатуры
+def get_main_menu(user_id: int):
+    buttons = [
+        [InlineKeyboardButton(text=f"{EMOJI['nft']} Купить NFT", callback_data="buy_nft")],
+        [InlineKeyboardButton(text=f"{EMOJI['stars']} Купить звезды", callback_data="buy_stars")],
+        [InlineKeyboardButton(text=f"{EMOJI['premium']} Купить премиум", callback_data="buy_premium")],
+        [InlineKeyboardButton(text=f"{EMOJI['support']} Поддержка", callback_data="support")]
+    ]
+    
+    if db.is_admin(user_id):
+        buttons.append([InlineKeyboardButton(text=f"{EMOJI['admin']} Админ", callback_data="admin")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_order_keyboard(order_id: int):
+    buttons = [
+        [
+            InlineKeyboardButton(text="✅ Взять", callback_data=f"take_{order_id}"),
+            InlineKeyboardButton(text="❌ СПАМ", callback_data=f"spam_{order_id}")
+        ],
+        [
+            InlineKeyboardButton(text="💰 Не оплатил", callback_data=f"nopay_{order_id}"),
+            InlineKeyboardButton(text="✅ Завершить", callback_data=f"complete_{order_id}")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# Обработчики
+@dp.message(Command("start"))
+async def start_cmd(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    if not await check_subscription(user_id):
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{CHANNEL_ID[1:]}")],
+            [InlineKeyboardButton(text="✅ Проверить", callback_data="check_sub")]
+        ])
+        await message.answer(f"{EMOJI['warning']} Подпишитесь на канал!", reply_markup=keyboard)
+        return
+    
+    db.add_user(user_id, message.from_user.username)
+    
+    await state.set_state(UserStates.main_menu)
+    await message.answer(
+        f"{EMOJI['main']} *Главное меню*\n\nВыберите действие:",
+        reply_markup=get_main_menu(user_id),
+        parse_mode="Markdown"
     )
 
-@dp.message(lambda message: message.location is not None)
-async def handle_location(message: types.Message):
-    lat = message.location.latitude
-    lon = message.location.longitude
-    await message.reply(f"Спасибо! Ваши координаты: {lat}, {lon}")
+@dp.callback_query(F.data == "check_sub")
+async def check_sub(callback: CallbackQuery, state: FSMContext):
+    if await check_subscription(callback.from_user.id):
+        await callback.message.edit_text(
+            f"{EMOJI['success']} *Главное меню*\n\nВыберите действие:",
+            reply_markup=get_main_menu(callback.from_user.id),
+            parse_mode="Markdown"
+        )
+    else:
+        await callback.answer("❌ Вы не подписаны!", show_alert=True)
 
+@dp.callback_query(F.data == "back")
+async def back_to_menu(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserStates.main_menu)
+    await callback.message.edit_text(
+        f"{EMOJI['main']} *Главное меню*\n\nВыберите действие:",
+        reply_markup=get_main_menu(callback.from_user.id),
+        parse_mode="Markdown"
+    )
+
+# NFT
+@dp.callback_query(F.data == "buy_nft")
+async def buy_nft(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserStates.buy_nft)
+    
+    nft_items = db.get_nft_items()
+    builder = InlineKeyboardBuilder()
+    
+    for item in nft_items[:8]:  # Первые 8
+        builder.button(text=f"{item['name']} | {item['price']}$", callback_data=f"nft_{item['id']}")
+    
+    builder.button(text=f"{EMOJI['back']} Назад", callback_data="back")
+    builder.adjust(1)
+    
+    text = f"{EMOJI['nft']} *NFT подарки*\n\nВыберите:"
+    await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("nft_"))
+async def select_nft(callback: CallbackQuery):
+    nft_id = int(callback.data.split("_")[1])
+    nft_items = db.get_nft_items()
+    item = next((i for i in nft_items if i['id'] == nft_id), None)
+    
+    if item:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Купить", callback_data=f"buynft_{nft_id}")],
+            [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="buy_nft")]
+        ])
+        
+        await callback.message.edit_text(
+            f"{EMOJI['nft']} *{item['name']}*\n\n"
+            f"💰 Цена: {item['price']}$\n"
+            f"🔗 Ссылка: {item['link']}",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
+@dp.callback_query(F.data.startswith("buynft_"))
+async def buy_nft_item(callback: CallbackQuery):
+    nft_id = int(callback.data.split("_")[1])
+    order_id = db.create_order(
+        user_id=callback.from_user.id,
+        order_type="nft",
+        details=f"NFT ID: {nft_id}"
+    )
+    
+    order = db.get_order(order_id)
+    text = f"""🆕 *НОВЫЙ ЗАКАЗ*
+
+1. Номер: #{order['id']}
+2. ID: `{order['user_id']}`
+3. Ник: @{callback.from_user.username or 'Нет'}
+4. Причина: NFT
+5. Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
+6. Состояние: ❌ Не взято"""
+    
+    await send_to_admins(text, get_order_keyboard(order_id))
+    
+    await callback.message.edit_text(
+        f"{EMOJI['success']} Заказ оформлен! С вами скоро свяжутся.",
+        parse_mode="Markdown"
+    )
+
+# Звезды
+@dp.callback_query(F.data == "buy_stars")
+async def buy_stars(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserStates.buy_stars)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="50 звезд - 99₽", callback_data="stars_1")],
+        [InlineKeyboardButton(text="100 звезд - 199₽", callback_data="stars_2")],
+        [InlineKeyboardButton(text="300 звезд - 499₽", callback_data="stars_3")],
+        [InlineKeyboardButton(text="500 звезд - 999₽", callback_data="stars_4")],
+        [InlineKeyboardButton(text="1000 звезд - 1999₽", callback_data="stars_5")],
+        [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="back")]
+    ])
+    
+    await callback.message.edit_text(
+        f"{EMOJI['stars']} *Telegram Stars*\n\nВыберите пакет:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("stars_"))
+async def select_stars(callback: CallbackQuery):
+    order_id = db.create_order(
+        user_id=callback.from_user.id,
+        order_type="stars",
+        details=callback.data
+    )
+    
+    order = db.get_order(order_id)
+    text = f"""🆕 *НОВЫЙ ЗАКАЗ*
+
+1. Номер: #{order['id']}
+2. ID: `{order['user_id']}`
+3. Ник: @{callback.from_user.username or 'Нет'}
+4. Причина: ЗВЕЗДЫ
+5. Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
+6. Состояние: ❌ Не взято"""
+    
+    await send_to_admins(text, get_order_keyboard(order_id))
+    
+    await callback.message.edit_text(
+        f"{EMOJI['success']} Заказ оформлен! С вами скоро свяжутся.",
+        parse_mode="Markdown"
+    )
+
+# Премиум
+@dp.callback_query(F.data == "buy_premium")
+async def buy_premium(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserStates.buy_premium)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 месяц - 6.2$", callback_data="premium_1")],
+        [InlineKeyboardButton(text="3 месяца - 10$", callback_data="premium_2")],
+        [InlineKeyboardButton(text="6 месяцев - 18$", callback_data="premium_3")],
+        [InlineKeyboardButton(text="1 год - 35$", callback_data="premium_4")],
+        [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="back")]
+    ])
+    
+    await callback.message.edit_text(
+        f"{EMOJI['premium']} *Telegram Premium*\n\nВыберите период:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data.startswith("premium_"))
+async def select_premium(callback: CallbackQuery):
+    order_id = db.create_order(
+        user_id=callback.from_user.id,
+        order_type="premium",
+        details=callback.data
+    )
+    
+    order = db.get_order(order_id)
+    text = f"""🆕 *НОВЫЙ ЗАКАЗ*
+
+1. Номер: #{order['id']}
+2. ID: `{order['user_id']}`
+3. Ник: @{callback.from_user.username or 'Нет'}
+4. Причина: PREMIUM
+5. Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
+6. Состояние: ❌ Не взято"""
+    
+    await send_to_admins(text, get_order_keyboard(order_id))
+    
+    await callback.message.edit_text(
+        f"{EMOJI['success']} Заказ оформлен! С вами скоро свяжутся.",
+        parse_mode="Markdown"
+    )
+
+# Поддержка
+@dp.callback_query(F.data == "support")
+async def support(callback: CallbackQuery):
+    order_id = db.create_order(
+        user_id=callback.from_user.id,
+        order_type="support",
+        details="Запрос в поддержку"
+    )
+    
+    order = db.get_order(order_id)
+    text = f"""🆕 *ПОДДЕРЖКА*
+
+1. Номер: #{order['id']}
+2. ID: `{order['user_id']}`
+3. Ник: @{callback.from_user.username or 'Нет'}
+4. Причина: ПОДДЕРЖКА
+5. Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}
+6. Состояние: ❌ Не взято"""
+    
+    await send_to_admins(text, get_order_keyboard(order_id))
+    
+    await callback.message.edit_text(
+        f"{EMOJI['success']} Ваш запрос отправлен! Ожидайте ответа.",
+        parse_mode="Markdown"
+    )
+
+# Админ панель
+@dp.callback_query(F.data == "admin")
+async def admin_panel(callback: CallbackQuery, state: FSMContext):
+    if not db.is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.admin_menu)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить NFT", callback_data="add_nft")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton(text=f"{EMOJI['back']} Назад", callback_data="back")]
+    ])
+    
+    await callback.message.edit_text(
+        f"{EMOJI['admin']} *Админ панель*\n\nВыберите действие:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "add_nft")
+async def add_nft_start(callback: CallbackQuery, state: FSMContext):
+    if not db.is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.add_nft_name)
+    await callback.message.edit_text(
+        f"{EMOJI['nft']} *Добавление NFT*\n\nВведите название подарка:",
+        parse_mode="Markdown"
+    )
+
+@dp.message(AdminStates.add_nft_name)
+async def add_nft_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await state.set_state(AdminStates.add_nft_price)
+    await message.answer(f"{EMOJI['money']} Введите цену в $:")
+
+@dp.message(AdminStates.add_nft_price)
+async def add_nft_price(message: Message, state: FSMContext):
+    try:
+        price = float(message.text)
+        await state.update_data(price=price)
+        await state.set_state(AdminStates.add_nft_link)
+        await message.answer(f"{EMOJI['link']} Отправьте ссылку на подарок:")
+    except:
+        await message.answer("❌ Введите число!")
+
+@dp.message(AdminStates.add_nft_link)
+async def add_nft_link(message: Message, state: FSMContext):
+    data = await state.get_data()
+    db.add_nft(data['name'], data['price'], message.text)
+    
+    await message.answer(f"{EMOJI['success']} NFT добавлен!")
+    await state.clear()
+
+# Обработка заказов админами
+@dp.callback_query(F.data.startswith("take_"))
+async def take_order(callback: CallbackQuery):
+    if not db.is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[1])
+    db.update_order_status(order_id, "b")  # В процессе
+    
+    order = db.get_order(order_id)
+    text = f"""🔄 *ЗАКАЗ В РАБОТЕ*
+
+1. Номер: #{order['id']}
+2. ID: `{order['user_id']}`
+3. Ник: @{callback.from_user.username or 'Нет'}
+4. Причина: {order['order_type'].upper()}
+5. Дата: {order['id']}
+6. Состояние: 🔄 В процессе
+7. Админ: @{callback.from_user.username}"""
+    
+    await callback.message.edit_text(text, reply_markup=get_order_keyboard(order_id), parse_mode="Markdown")
+    await callback.answer("✅ Заказ взят!")
+
+@dp.callback_query(F.data.startswith("complete_"))
+async def complete_order(callback: CallbackQuery):
+    if not db.is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[1])
+    db.update_order_status(order_id, "s")  # Завершено
+    await callback.answer("✅ Заказ завершен!")
+
+@dp.callback_query(F.data.startswith("spam_"))
+async def spam_order(callback: CallbackQuery):
+    if not db.is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[1])
+    db.update_order_status(order_id, "z")  # Спам
+    
+    order = db.get_order(order_id)
+    try:
+        await bot.send_message(order['user_id'], f"{EMOJI['error']} Ошибка. Связь с базой...")
+    except:
+        pass
+    
+    await callback.answer("🚫 Помечено как спам!")
+
+@dp.callback_query(F.data.startswith("nopay_"))
+async def nopay_order(callback: CallbackQuery):
+    if not db.is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет доступа!", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[1])
+    db.update_order_status(order_id, "g")  # Не оплатил
+    
+    order = db.get_order(order_id)
+    try:
+        await bot.send_message(order['user_id'], f"{EMOJI['error']} Вы не оплатили заказ!")
+    except:
+        pass
+    
+    await callback.answer("💰 Не оплатил!")
+
+# Запуск бота
 async def main():
+    logging.basicConfig(level=logging.INFO)
+    print("Бот запущен!")
     await dp.start_polling(bot)
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nБот остановлен")
+    finally:
+        db.close()
