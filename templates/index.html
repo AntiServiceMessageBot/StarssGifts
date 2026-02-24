@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Marketplace</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div id="app">
+        <nav class="nav-bar">
+            <button class="nav-btn active" onclick="showSection('catalog')">🏠 Каталог</button>
+            <button class="nav-btn" onclick="showSection('favorites')">⭐ Избранное</button>
+            <button class="nav-btn" onclick="showSection('cart')">🛒 Корзина</button>
+        </nav>
+
+        <div id="catalog" class="section active">
+            <div class="banner">
+                <h2>🎉 Добро пожаловать в маркетплейс!</h2>
+                <p>Лучшие товары от проверенных продавцов</p>
+            </div>
+            <div id="products-grid" class="products-grid"></div>
+        </div>
+
+        <div id="favorites" class="section">
+            <h2>⭐ Избранное</h2>
+            <div id="favorites-grid" class="products-grid"></div>
+        </div>
+
+        <div id="cart" class="section">
+            <h2>🛒 Корзина</h2>
+            <div id="cart-items"></div>
+            <div class="cart-total">
+                <p>Итого: <span id="total-price">0</span> ₸</p>
+                <button class="checkout-btn" onclick="checkout()">Оформить заказ</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
